@@ -1,10 +1,8 @@
-import numpy as np
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import log_loss
 import numpy as np
 from mixalot.datasets import MixedDataset
 import torch
-from torch.optim import Adam
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -12,7 +10,7 @@ import numpy as np
 from torch.utils.data import Dataset
 from torch.nn import CrossEntropyLoss
 from torch.utils.data import DataLoader
-import torch.nn.init as init
+from torch.optim.lr_scheduler import LambdaLR
 
 # Cross validate a random forest model by looping over observers and folds.
 def cross_validate_rf(dataset_spec, obs1_folds, obs2_folds, fold_test_indices):
@@ -113,7 +111,6 @@ def cross_validate_basic_ann(dataset_spec,
                              num_models,
                              lr,
                              final_lr,
-                             init_scale,
                              num_x_var,
                              batch_size,
                              epochs,
@@ -127,8 +124,7 @@ def cross_validate_basic_ann(dataset_spec,
     base_model_args = (num_x_var,
                        2,
                        hidden_sizes,
-                       dropout_prob,
-                       init_scale)
+                       dropout_prob)
     # Loop over observers
     for obs_number in [1,2]:
         if obs_number == 1:
@@ -162,11 +158,11 @@ def cross_validate_basic_ann(dataset_spec,
             test_dl = DataLoader(test_ds, batch_size=batch_size, shuffle=True)
 
             # Train an ensemble of basic artificial neural network (ANN)
-            ensemble = EnsembleBasicAnn(num_models,
-                                        lr,
-                                        BasicAnn,
-                                        *base_model_args,
-                                        final_lr=final_lr)
+            ensemble = EnsembleTorchModel(num_models,
+                                          lr,
+                                          BasicAnn,
+                                          *base_model_args,
+                                          final_lr=final_lr)
             ensemble.train(train_dl, device, epochs, test_dl)
 
             # Predict the probabilities for test data
@@ -213,91 +209,68 @@ def cross_validate_basic_ann(dataset_spec,
 
 
 class BasicAnn(nn.Module):
+    """
+    Basic artificial neural network (ANN) model.
 
-    def __init__(self, num_x_var, num_cat, hidden_sizes, dropout_prob, init_scale):
+    This class represents a basic ANN model with an arbitrary number of hidden layers.
+    The structure of the model includes an input layer, a sequence of alternating dense and dropout layers,
+    and an output layer. The activation function applied after each dense layer is ReLU.
+
+    Attributes:
+        hidden_layers (nn.ModuleList): A sequence of alternating dense and dropout layers.
+        output_layer (nn.Linear): The output layer of the model.
+    """
+
+    def __init__(self, num_x_var, num_cat, hidden_sizes, dropout_prob):
+        """
+        Initialize a new BasicAnn instance.
+
+        Args:
+            num_x_var (int): The number of input variables.
+            num_cat (int): The number of output categories.
+            hidden_sizes (list of int): A list of the sizes of the hidden layers.
+            dropout_prob (float): The dropout probability for the dropout layers.
+        """
         super(BasicAnn, self).__init__()
+
         self.hidden_layers = nn.ModuleList()
+        
+        # Define the input size to the first layer.
         input_size = num_x_var
-        
-        
-        self.init_scale = init_scale
-    
-        # Initialize weights with Xavier uniform method
-        init_func = init.xavier_uniform_
-        
+
+        # Create the hidden layers
         for h, hidden_size in enumerate(hidden_sizes):
-          layer = nn.Linear(input_size, hidden_size)
-          init_func(layer.weight) # initialize weights
-          
-          # Use smaller bias initialization  
-          layer.bias.data.fill_(self.init_scale) 
-          
-          self.hidden_layers.append(layer)
-          
-          self.hidden_layers.append(nn.Dropout(dropout_prob))
-          #if h+1 < len(hidden_sizes):
-          #  self.hidden_layers.append(nn.Dropout(dropout_prob))
-            
-          input_size = hidden_size
-          
-        # Output layer
+            # Dense layer.
+            self.hidden_layers.append(nn.Linear(input_size, hidden_size))
+            # Dropout layer.
+            self.hidden_layers.append(nn.Dropout(dropout_prob))
+
+            # The output size of the current layer is the input size of the next layer.
+            input_size = hidden_size
+
+        # Define the output layer.
         self.output_layer = nn.Linear(input_size, num_cat)
-        init_func(self.output_layer.weight)
-        self.output_layer.bias.data.fill_(self.init_scale)
 
     def forward(self, x):
+        """
+        Implement the forward pass.
+
+        Args:
+            x (torch.Tensor): The input tensor.
+
+        Returns:
+            torch.Tensor: The output tensor of the model.
+        """
+        # Pass through each hidden layer.
         for hidden_layer in self.hidden_layers:
-            x = F.relu(hidden_layer(x))  # apply activation function after each dense layer
+            # Apply activation function after each dense layer.
+            x = F.relu(hidden_layer(x))
             
-        x = self.output_layer(x)  # no activation function after output layer
+        # Pass through the output layer. There is no activation function after the output layer.
+        x = self.output_layer(x)
+
         return x
 
-
-
-#class BasicAnn(nn.Module):
-#    def __init__(self, num_x_var, num_cat, hidden_sizes, dropout_prob):
-#        super(BasicAnn, self).__init__()
-#        
-#        self.hidden_layers = nn.ModuleList()
-#        
-#        input_size = num_x_var
-#        for h, hidden_size in enumerate(hidden_sizes):
-#            self.hidden_layers.append(nn.Linear(input_size, hidden_size))
-#            if h+1 < len(hidden_sizes):
-#                # Do not use dropout on the final layer
-#                self.hidden_layers.append(nn.Dropout(dropout_prob))
-#            input_size = hidden_size  # the output size of the current layer is the input size of the next layer
-#
-#        # Output layer
-#        self.output_layer = nn.Linear(input_size, num_cat)
-#
-#    def forward(self, x):
-#        for hidden_layer in self.hidden_layers:
-#            x = F.relu(hidden_layer(x))  # apply activation function after each dense layer
-#            
-#        x = self.output_layer(x)  # no activation function after output layer
-#        return x
-
-#def train_basic_ann():
-#    # Train an ensemble of models to predict the category (Sex)
-#    overall_test_loss = 0
-#    criterion = CrossEntropyLoss()
-#    base_model_args = (num_var,
-#                       2,
-#                       modelParam['hidden_sizes'],
-#                       modelParam['dropout_prob'])
-#    ensemble = EnsembleModel(num_models, lr, base_model_class, *base_model_args)
-#    final_epoch_losses = ensemble.train(train_dl, device, epochs)
-#    with torch.no_grad():
-#        train_loss = np.mean(final_epoch_losses)
-#        test_input = np.concatenate((Xtest, Mtest), axis=1)
-#        test_input = torch.tensor(test_input, dtype=torch.float)
-#        test_probs = ensemble.predict_prob(test_input, device)
-#        test_logits = torch.log(test_probs)
-#        targets = torch.tensor(ytest, dtype=torch.long).to(device)
-#        loss = criterion(test_logits, targets)
-#        num_test_obs += len(ytest)
-#        overall_test_loss += loss.item() * len(ytest)
 
 def train_one_epoch_for_basic_ann(model, dataloader, criterion, device, optimizer):
     model.train()  # Set the model to training mode
@@ -338,7 +311,20 @@ def test_for_basic_ann(model, dataloader, criterion, device):
     # Return the total loss divided by the number of observations
     return total_loss / total_obs
 
-class EnsembleBasicAnn:
+class EnsembleTorchModel:
+    """
+    A class that represents an ensemble of PyTorch models.
+
+    This class handles the training of an ensemble of PyTorch models and prediction
+    using the ensemble model. During prediction, the ensemble model outputs the 
+    averaged probabilities from all the individual models.
+
+    Attributes:
+        models (list): List of PyTorch models forming the ensemble.
+        lr (float): Learning rate for training the models.
+        final_lr (float): Final learning rate for the LambdaLR scheduler.
+    """
+
     def __init__(self,
                  num_models,
                  lr,
@@ -346,74 +332,124 @@ class EnsembleBasicAnn:
                  *base_model_args,
                  final_lr=None,
                  **base_model_kwargs):
-        self.models = [base_model_class(*base_model_args,
-                                        **base_model_kwargs)
-                                        for _ in range(num_models)]
+        """
+        Initialize an EnsembleTorchModel instance.
+
+        Args:
+            num_models (int): The number of models in the ensemble.
+            lr (float): The learning rate for training the models.
+            base_model_class (type): The class of the models forming the ensemble.
+            final_lr (float, optional): The final learning rate for the LambdaLR scheduler.
+                                        If not provided, it will be the same as lr.
+            *base_model_args: Positional arguments to be passed to base_model_class.
+            **base_model_kwargs: Keyword arguments to be passed to base_model_class.
+        """
+        self.models = [base_model_class(*base_model_args, **base_model_kwargs)
+                       for _ in range(num_models)]
         self.lr = lr
         self.final_lr = final_lr
 
-    def train(self, train_dl, device, epochs, test_dl):
+    def train(self, train_dl, device, epochs, test_dl=None):
+        """
+        Train the ensemble model.
+
+        Args:
+            train_dl (torch.utils.data.DataLoader): The DataLoader for training data.
+            device (torch.device): The device (CPU/GPU) to be used for training.
+            epochs (int): The number of epochs for training.
+            test_dl (torch.utils.data.DataLoader, optional): The DataLoader for test data.
+                If provided, the function will also calculate, report, and return the test loss.
+
+        Returns:
+            float: The mean training loss for the ensemble model.
+            float, optional: The mean test loss for the ensemble model. Only returned if test_dl is provided.
+        """
+
+        # Use cross entropy loss
         criterion = CrossEntropyLoss()
+
+        # If a final learning rate is specified, use it
         initial_lr = self.lr
         if self.final_lr is not None:
             final_lr = self.final_lr
         else:
             final_lr = initial_lr
+        # lambda1 is the learning rate decay, set to equal final_lr on the
+        # final epoch
         lambda1 = lambda epoch: (final_lr / initial_lr) + (1 - epoch / epochs) * (1 - final_lr / initial_lr)
 
+        # Initialize the training loss and (if necessary) the test loss
         ensemble_train_loss = 0.0
         total_train_obs = 0
+        if test_dl is not None:
+            ensemble_test_loss = 0.0
+            total_test_obs = 0
+
+        # Loop over models
         for i, model in enumerate(self.models, start=1):
             model.to(device)
-            #optimizer = Adam(model.parameters(), lr=self.lr)
             optimizer = torch.optim.Adam(model.parameters(), lr=initial_lr)
             scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda1)
             progress_bar = tqdm(range(epochs), desc=f"Training model #{i}")
+
+            # Loop over epochs
             for epoch_num in progress_bar:
                 epoch_loss = train_one_epoch_for_basic_ann(model, train_dl, criterion, device, optimizer)
                 progress_bar.set_postfix({"epoch": epoch_num+1, "loss": epoch_loss})
             optimizer.step()
             scheduler.step()
-            summed_train_loss, num_train_obs = calc_summed_loss(model, train_dl, device)
-            summed_test_loss, num_test_obs = calc_summed_loss(model, test_dl, device)
-            mean_train_loss = summed_train_loss / num_train_obs
-            mean_test_loss = summed_test_loss / num_test_obs
-            print(f'Mean train loss = {mean_train_loss} and mean test loss = {mean_test_loss}')
-            ensemble_train_loss += summed_train_loss
-            total_train_obs += num_train_obs
-        
-        # TODO: return the ensemble ploss here (based on averaging the training probabilities)
-        return ensemble_train_loss / total_train_obs
 
+            # Update training loss and number of observations
+            summed_train_loss, num_train_obs = calc_summed_loss(model, train_dl, device)
+            ensemble_train_loss += summed_train_loss
+            mean_train_loss = summed_train_loss / num_train_obs
+            total_train_obs += num_train_obs
+
+            # If necessary, update training loss and number of observations
+            if test_dl is not None:
+                summed_test_loss, num_test_obs = calc_summed_loss(model, test_dl, device)
+                ensemble_test_loss += summed_test_loss
+                mean_test_loss = summed_test_loss / num_test_obs
+                total_test_obs += num_test_obs
+                mean_test_loss = summed_test_loss / num_test_obs
+                print(f'Mean train loss = {mean_train_loss} and mean test loss = {mean_test_loss}')
+            else:
+                print(f'Mean train loss = {mean_train_loss}')
+        
+        if test_dl is not None:
+            return ensemble_train_loss / total_train_obs, ensemble_test_loss / total_test_obs
+        else:
+            return ensemble_train_loss / total_train_obs
 
     def predict_prob(self, x, device):
-        # Predict ensembled probabilities. This does not return either of:
-        # *not* (1) unconstrained values, like the output of model.forward
-        # *not* (2) the log probabilities
-        #
-        # Ideally we might output unconstrained values as output by model.forward
-        # for conceptual consistency, but that's not actually possible if we
-        # average in the probability space, which I think is the correct thing
-        # to do. The reason is that one cannot uniquely determine the x_i from
-        # the p_i where the following relations hold:
-        #
-        # x_i is an unconstrained vector
-        # p_i = SoftMax(x_i) = exp(x_i) / sum(exp(x))
-        # z_i = log(p_i) = F.log_softmax
-        #
-        # Hence, we output probabilities
+        """
+        Predict using the ensemble model.
+
+        This method computes the averaged probabilities from all the individual models.
+        The method does not return either of:
+        - (1) unconstrained values, like the output of model.forward
+        - (2) the log probabilities
+
+        Args:
+            x (torch.Tensor): The input tensor.
+            device (torch.device): The device (CPU/GPU) to be used for prediction.
+
+        Returns:
+            torch.Tensor: The tensor of averaged probabilities.
+        """
         all_probabilities = []
         for model in self.models:
             model.eval()
             probs = F.softmax(model(x.to(device)), dim=1)
             all_probabilities.append(probs)
 
-        #all_probabilities = [F.softmax(model(x.to(device)), dim=1) for model in self.models]
         # Stack predictions to a tensor
         stacked_probabilities = torch.stack(all_probabilities)
         # Compute the averaged probabilities
         average_probabilities = torch.mean(stacked_probabilities, dim=0)
+
         return average_probabilities
+
 
 def calc_summed_loss(model, dataloader, device):
     criterion = CrossEntropyLoss()

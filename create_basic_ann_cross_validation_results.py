@@ -11,16 +11,17 @@ def main():
     obs1_data, obs2_data, num_scalers,\
         obs1_folds, obs2_folds, fold_test_indices, dataset_spec =\
             load_innominate_data(35, 884683)
+            #load_innominate_data(5, 884683)
     batch_size = 1024
     hidden_sizes = [20]
     dropout_prob = 0.93
-    num_models = 100
+    num_models = 2
     lr = 1e-3
     final_lr = 1e-3
     # num_x_var could be determined from the other inputs
     num_x_var = 2 + 5 + 9
     epochs = 10000
-    init_scale = 1
+    #epochs = 1000
     # If possible, use the GPU. Otherwise, use the CPU
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -34,7 +35,6 @@ def main():
                                  num_models,
                                  lr,
                                  final_lr,
-                                 init_scale,
                                  num_x_var,
                                  batch_size,
                                  epochs,
