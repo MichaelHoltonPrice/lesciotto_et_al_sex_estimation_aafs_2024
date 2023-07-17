@@ -32,7 +32,8 @@ def fit_random_forest_wrapper(
         train_data: TrainData tuple with (X_categorical, X_ordinal, X_numerical)
         test_data: TestData tuple with (X_categorical, X_ordinal, X_numerical)
         test_indices: List of study indices for test data 
-        hp: Dict with hyperparameters like {'num_estimators': 100}
+        hp: Dict with hyperparameters:
+            'num _estimators': Number of estimators for the random forest
 
     Returns:
         clf: Trained RandomForestClassifier
@@ -82,6 +83,103 @@ def fit_random_forest_wrapper(
     
     return clf, fold_summed_test_loss, study_index_to_prob
 
+def fit_basic_ann_ensemble_wrapper(
+        dataset_spec, 
+        train_data,
+        test_data,
+        test_indices,
+        hp
+    ):
+    """Train an ensemble of simple feed forward neural network classifiers and
+    return test predictions.
+
+    Given a dataset spec, training data, test data, test indices, and hyperparameters,
+    this function trains an ensemble of neural networks on the training data and 
+    returns the trained classifier, summed loss on the test data, and a dictionary
+    mapping study indices to predicted probabilities for the test data.
+
+    Args:
+        dataset_spec: DatasetSpec object describing the columns
+        train_data: TrainData tuple with (X_categorical, X_ordinal, X_numerical)
+        test_data: TestData tuple with (X_categorical, X_ordinal, X_numerical)
+        test_indices: List of study indices for test data 
+        hp: Dict with hyperparameters:
+            'batch_size': size of batches for model training
+            'num_x_var': number of input features
+            'hidden_sizes': list of number of neurons in each hidden layer
+            'dropout_prob': probability of zeroing activations in dropout layers
+            'num_models': number of models in the ensemble
+            'lr': initial learning rate
+            'final_lr': final learning rate for the exponential decay (use None for no decay)
+            'epochs': number of complete passes over the training dataset
+            'device': device for computation ('cpu' or 'cuda')
+
+    Returns:
+        ensemble: Trained EnsembleTorchModel object
+        fold_summed_test_loss: Total log loss on test data 
+        study_index_to_prob: Dict mapping study indices to predicted probabilities
+    
+    """
+    # Extract X and y arrays from training data
+    # y has not yet been extracted from the following matrices. Create
+    # a MixedDataset object that will accomplish the extraction for us.
+    # Do so for both the training and test data.
+    Xcat0, Xord0, Xnum0 = train_data
+    mixed_dataset = MixedDataset(dataset_spec, Xcat0, Xord0, Xnum0)
+ 
+    Xcat0, Xord0, Xnum0 = train_data
+    mixed_dataset = MixedDataset(dataset_spec, Xcat0, Xord0, Xnum0)
+    Xcat, Xord, Xnum, y = mixed_dataset.get_arrays()
+    # need to start indexing from 0
+    y = [k-1 for k in y]
+    X = np.hstack([Xcat, Xord, Xnum])
+    train_ds = InputTargetDataset(X,y)
+    train_dl = DataLoader(train_ds, batch_size=hp['batch_size'], shuffle=True)
+
+    Xcat0_test, Xord0_test, Xnum0_test = test_data
+    mixed_dataset_test = MixedDataset(dataset_spec, Xcat0_test, Xord0_test, Xnum0_test)
+    Xcat_test, Xord_test, Xnum_test, y_test = mixed_dataset_test.get_arrays()
+    # need to start indexing from 0
+    y_test = [k-1 for k in y_test]
+    X_test = np.hstack([Xcat_test, Xord_test, Xnum_test])
+    test_ds = InputTargetDataset(X_test,y_test)
+    test_dl = DataLoader(test_ds, batch_size=hp['batch_size'], shuffle=True)
+
+    base_model_args = (hp['num_x_var'],
+                       2, # there are two output categories (female and male)
+                       hp['hidden_sizes'],
+                       hp['dropout_prob'])
+    # Train an ensemble of basic artificial neural network (ANN)
+    ensemble = EnsembleTorchModel(hp['num_models'],
+                                  hp['lr'],
+                                  BasicAnn,
+                                  *base_model_args,
+                                  final_lr=hp['final_lr'])
+    ensemble.train(train_dl, hp['device'], hp['epochs'], test_dl)
+
+    # Predict the probabilities for test data
+    num_obs = len(y_test)
+    with torch.no_grad():
+        test_input = torch.tensor(X_test, dtype=torch.float)
+        y_pred_prob = ensemble.predict_prob(test_input, hp['device']).cpu().numpy()
+    
+    # Calculate the test loss for this fold (multiply by the number of
+    # observations in this fold so that what we return is the total
+    # test loss)
+    #
+    # We input the labels just in case all the values in y_test are the
+    # same, which can lead to log_loss guessing incorrectly about how
+    # y_test is indexed.
+    fold_summed_test_loss = log_loss(y_test, y_pred_prob, labels=[0,1])*num_obs
+    assert len(test_indices) == num_obs
+
+    study_index_to_prob = dict()
+    for i, original_index in enumerate(test_indices):
+        values = y_pred_prob[i,:]
+        study_index_to_prob[original_index] = values
+    
+    return ensemble, fold_summed_test_loss, study_index_to_prob
+
    
 # TODO: update the number of viable models
 def cross_validate(dataset_spec, train_test_folds, fold_test_indices, model_type, hp):
@@ -123,8 +221,12 @@ def cross_validate(dataset_spec, train_test_folds, fold_test_indices, model_type
             # Use the wrapper function to fit the random forest model and obtain predictions
             _, fold_summed_test_loss, fold_study_index_to_prob =\
                 fit_random_forest_wrapper(dataset_spec, train_data, test_data, test_indices, hp)
+        elif model_type.lower() == 'basic ann ensemble':
+            # Use the wrapper function to fit the ensemble and obtain predictions
+            _, fold_summed_test_loss, fold_study_index_to_prob =\
+                fit_basic_ann_ensemble_wrapper(dataset_spec, train_data, test_data, test_indices, hp)
         else:
-            raise Exception('Model type not supported yet')
+            raise Exception(f'Unrecognized model_type = {model_type}')
 
         # Update the total loss and the prediction dictionary with the results from this fold
         overall_summed_test_loss += fold_summed_test_loss
