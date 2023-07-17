@@ -11,81 +11,132 @@ from torch.utils.data import Dataset
 from torch.nn import CrossEntropyLoss
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import LambdaLR
+#from typing import Tuple, List, Dict
 
-# Cross validate a random forest model by looping over observers and folds.
-def cross_validate_rf(dataset_spec, obs1_folds, obs2_folds, fold_test_indices):
-    # Initialize dictionaries to store predicted test probabilities
-    obs1_output_dict = {}
-    obs2_output_dict = {}
-    # Initialize the overall loss (the sumemd loss, not the mean)
-    obs1_overall_test_loss = 0
-    obs2_overall_test_loss = 0
-    # Loop over observers
-    for obs_number in [1,2]:
-        if obs_number == 1:
-            folds = obs1_folds
-        else:
-            assert obs_number == 2
-            folds = obs2_folds
+def fit_random_forest_wrapper(
+        dataset_spec, 
+        train_data,
+        test_data,
+        test_indices,
+        hp
+    ):
+    """Train a random forest classifier and return test predictions.
+
+    Given a dataset spec, training data, test data, test indices, and hyperparameters,
+    this function trains a random forest classifier on the training data and 
+    returns the trained classifier, summed loss on the test data, and a dictionary
+    mapping study indices to predicted probabilities for the test data.
+
+    Args:
+        dataset_spec: DatasetSpec object describing the columns
+        train_data: TrainData tuple with (X_categorical, X_ordinal, X_numerical)
+        test_data: TestData tuple with (X_categorical, X_ordinal, X_numerical)
+        test_indices: List of study indices for test data 
+        hp: Dict with hyperparameters like {'num_estimators': 100}
+
+    Returns:
+        clf: Trained RandomForestClassifier
+        fold_summed_test_loss: Total log loss on test data 
+        study_index_to_prob: Dict mapping study indices to predicted probabilities
+    
+    """
+    
+    # Extract X and y arrays from training data
+    # y has not yet been extracted from the following matrices. Create
+    # a MixedDataset object that will accomplish the extraction for us.
+    # Do so for both the training and test data.
+    Xcat0, Xord0, Xnum0 = train_data
+    mixed_dataset = MixedDataset(dataset_spec, Xcat0, Xord0, Xnum0)
+    Xcat, Xord, Xnum, y = mixed_dataset.get_arrays()
+    X = np.hstack([Xcat, Xord, Xnum])
+
+    Xcat0_test, Xord0_test, Xnum0_test = test_data
+    mixed_dataset_test = MixedDataset(dataset_spec, Xcat0_test, Xord0_test, Xnum0_test)
+    Xcat_test, Xord_test, Xnum_test, y_test = mixed_dataset_test.get_arrays()
+
+    # TODO: consider supporting imputation here
+
+    # Train a random forest
+    clf = RandomForestClassifier(n_estimators=hp['num_estimators'])
+    clf.fit(X, y)
+
+    # Predict the probabilities for test data
+    X_test = np.hstack([Xcat_test, Xord_test, Xnum_test])
+    y_pred_prob = clf.predict_proba(X_test)
+    num_obs = y_pred_prob.shape[0]
+
+    # Calculate the test loss for this fold (multiply by the number of
+    # observations in this fold so that what we return is the total
+    # test loss)
+    #
+    # We input the labels just in case all the values in y_test are the
+    # same, which can lead to log_loss guessing incorrectly about how
+    # y_test is indexed.
+    fold_summed_test_loss = log_loss(y_test, y_pred_prob, labels=clf.classes_)*num_obs
+    assert len(test_indices) == num_obs
+
+    study_index_to_prob = dict()
+    for i, original_index in enumerate(test_indices):
+        values = y_pred_prob[i,:]
+        study_index_to_prob[original_index] = values
+    
+    return clf, fold_summed_test_loss, study_index_to_prob
+
+   
+# TODO: update the number of viable models
+def cross_validate(dataset_spec, train_test_folds, fold_test_indices, model_type, hp):
+    """Cross validate a model by looping over the input folds.
+
+    This function performs cross validation for either a random forest model 
+    or an ensemble of basic feed forward artificial neural networks. It uses the 
+    fit_random_forest_wrapper function for the random forest model. 
+
+    Args:
+        dataset_spec: DatasetSpec object describing the columns
+        train_test_folds: List of tuples, each containing train and test data
+        fold_test_indices: List of lists, each containing test indices for each fold
+        model_type: String, type of the model for training ('random forest' or 'neural network')
+        hp: Dict with hyperparameters like {'num_estimators': 100}
+
+    Returns:
+        overall_summed_test_loss: Total summed loss from all folds
+        prob_matrix: Numpy array representing probabilities of predictions for all studies
+
+    Raises:
+        Exception: If the model_type is not recognized
+    """
+    
+    # Initialize a dictionary that maps the study index to the predicted
+    # probability. This will hold our eventual predictions.
+    study_index_to_prob = {}
+    
+    # Initialize the overall loss (the summed loss, not the mean)
+    overall_summed_test_loss = 0
+    
+    # Loop over folds. For each fold, we're going to train on the training data
+    # and then make predictions on the test data.
+    for fold_idx, (train_data, test_data) in enumerate(train_test_folds):
+        test_indices = fold_test_indices[fold_idx]
         
-        # Loop over folds
-        for fold_idx, (train_data, test_data) in enumerate(folds):
-            test_indices = fold_test_indices[fold_idx]
-            # y has not yet been extracted from the following matrices. Create
-            # a MixedDataset object that will accomplish the extraction for us.
-            # Do so for both the training and test data.
-            Xcat0, Xord0, Xnum0 = train_data
-            mixed_dataset = MixedDataset(dataset_spec, Xcat0, Xord0, Xnum0)
-            Xcat, Xord, Xnum, y = mixed_dataset.get_arrays()
-            X = np.hstack([Xcat, Xord, Xnum])
+        # Check the model type to determine the training and prediction process
+        if model_type.lower() == 'random forest':
+            # Use the wrapper function to fit the random forest model and obtain predictions
+            _, fold_summed_test_loss, fold_study_index_to_prob =\
+                fit_random_forest_wrapper(dataset_spec, train_data, test_data, test_indices, hp)
+        else:
+            raise Exception('Model type not supported yet')
 
-            Xcat0_test, Xord0_test, Xnum0_test = test_data
-            mixed_dataset_test = MixedDataset(dataset_spec, Xcat0_test, Xord0_test, Xnum0_test)
-            Xcat_test, Xord_test, Xnum_test, y_test = mixed_dataset_test.get_arrays()
+        # Update the total loss and the prediction dictionary with the results from this fold
+        overall_summed_test_loss += fold_summed_test_loss
+        study_index_to_prob.update(fold_study_index_to_prob)
 
-            # TODO: consider supporting imputation here
+    # Create a numpy array from the dictionary study_index_to_prob. The keys are sorted to
+    # ensure that the studies are always in the same order in the array.
+    keys = np.array(sorted(study_index_to_prob.keys()))
+    prob_matrix = np.array([study_index_to_prob[key] for key in keys])
 
-            # Train a random forest
-            clf = RandomForestClassifier(n_estimators=10000)
-            clf.fit(X, y)
+    return  overall_summed_test_loss, prob_matrix
 
-            # Predict the probabilities for test data
-            X_test = np.hstack([Xcat_test, Xord_test, Xnum_test])
-            y_pred_prob = clf.predict_proba(X_test)
-            num_obs = y_pred_prob.shape[0]
-
-            # Calculate the test loss for this fold (multiply by the number of
-            # observations in this fold so that what we return is the total
-            # test loss)
-            #
-            # We input the labels just in case all the values in y_test are the
-            # same, which can lead to log_loss guessing incorrectly about how
-            # y_test is indexed.
-            fold_test_loss = log_loss(y_test, y_pred_prob, labels=clf.classes_)*num_obs
-            if obs_number == 1:
-                obs1_overall_test_loss += fold_test_loss
-            else:
-                assert obs_number == 2
-                obs2_overall_test_loss += fold_test_loss
-
-            assert len(test_indices) == num_obs
-            for i, original_index in enumerate(test_indices):
-                values = y_pred_prob[i,:]
-                if obs_number == 1:
-                    obs1_output_dict[original_index] = values
-                else:
-                    assert obs_number == 2
-                    obs2_output_dict[original_index] = values
-
-    # Turn the dictionaries, which map the original indices onto probabilities,
-    # into numpy arrays
-    keys1 = np.array(sorted(obs1_output_dict.keys()))
-    obs1_prob_matrix = np.array([obs1_output_dict[key] for key in keys1])
-
-    keys2 = np.array(sorted(obs2_output_dict.keys()))
-    obs2_prob_matrix = np.array([obs2_output_dict[key] for key in keys2])
-
-    return  obs1_overall_test_loss, obs2_overall_test_loss, obs1_prob_matrix, obs2_prob_matrix
 
 class InputTargetDataset(Dataset):
     def __init__(self, inputs, targets):

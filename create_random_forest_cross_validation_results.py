@@ -1,18 +1,23 @@
 import numpy as np
 import os
-from models import cross_validate_rf
 from sexest import load_innominate_data
 import json
+from models import cross_validate
 
 def main():
     obs1_data, obs2_data, num_scalers,\
         obs1_folds, obs2_folds, fold_test_indices, dataset_spec =\
             load_innominate_data(35, 884683)
-    obs1_overall_test_loss, obs2_overall_test_loss, obs1_prob_matrix, obs2_prob_matrix=\
-        cross_validate_rf(dataset_spec, obs1_folds, obs2_folds, fold_test_indices)
 
+    hp = {'num_estimators': 10000}
+    obs1_overall_test_loss, obs1_prob_matrix =\
+        cross_validate(dataset_spec, obs1_folds, fold_test_indices, 'random forest', hp)
+    obs2_overall_test_loss, obs2_prob_matrix =\
+        cross_validate(dataset_spec, obs2_folds, fold_test_indices, 'random forest', hp)
     
     N = obs1_prob_matrix.shape[0]
+    assert N == 35
+    assert obs2_prob_matrix.shape[0] == N
 
     # Folder path 
     output_folder = os.path.join('outputs', 'random_forest')
