@@ -1,6 +1,9 @@
 import os
 from sklearn.model_selection import KFold
 from mixalot.datasets import load_mixed_data
+import json
+import pandas as pd
+import numpy as np
 
 def load_innominate_data(num_folds, seed):
     spec_file_path = os.path.join('inputs', 'dataset_spec_innominate.json')
@@ -51,3 +54,54 @@ def load_innominate_data(num_folds, seed):
     dataset_spec = mixed_data.dataset_spec
     dataset_spec.y_var = 'Sex'
     return obs1_data, obs2_data, num_scalers, obs1_folds, obs2_folds, fold_test_indices, dataset_spec
+
+
+def save_cross_validation_results(output_folder,
+                                  obs1_overall_test_loss,
+                                  obs1_prob_matrix,
+                                  obs2_overall_test_loss,
+                                  obs2_prob_matrix,
+                                  y_data,
+                                  hp):
+    # Calculate and check the number of observations
+    N = obs1_prob_matrix.shape[0]
+    assert N == 35
+    assert obs2_prob_matrix.shape[0] == N
+
+    # Calculate loss vectors
+    obs1_loss_vect = [-np.log(obs1_prob_matrix[n, y_data[n]-1]) for n in range(N)]
+    obs2_loss_vect = [-np.log(obs2_prob_matrix[n, y_data[n]-1]) for n in range(N)]
+
+    # Create output dataframes
+    obs1_output_df = pd.DataFrame(obs1_prob_matrix, columns=['prob_female', 'prob_male'])
+    obs1_output_df['cross_entropy_loss'] = obs1_loss_vect
+    obs1_output_df['known_sex'] = ['Female' if v == 1 else 'Male' for v in y_data]
+
+    obs2_output_df = pd.DataFrame(obs2_prob_matrix, columns=['prob_female', 'prob_male'])
+    obs2_output_df['cross_entropy_loss'] = obs2_loss_vect
+    obs2_output_df['known_sex'] = ['Female' if v == 1 else 'Male' for v in y_data]
+
+    # Create folder if it doesn't exist
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+
+    # Write dataframes to csv 
+    obs1_output_df.to_csv(os.path.join(output_folder, 'observer1_probabilities.csv'), index=False)
+    obs2_output_df.to_csv(os.path.join(output_folder, 'observer2_probabilities.csv'), index=False)
+
+    # Write hyperparameters to a json file
+    with open(os.path.join(output_folder, 'hyperparameters.json'), 'w') as f:
+        json.dump(hp, f)
+
+    # Compute mean test losses
+    obs1_mean_test_loss = obs1_overall_test_loss / N
+    obs2_mean_test_loss = obs2_overall_test_loss / N
+
+    # Write the mean test losses to a json file
+    test_losses = {'obs1_mean_test_loss': obs1_mean_test_loss,
+                   'obs2_mean_test_loss': obs2_mean_test_loss}
+    
+    with open(os.path.join(output_folder, 'test_losses.json'), 'w') as f:
+        json.dump(test_losses, f)
+
+    return obs1_mean_test_loss, obs2_mean_test_loss
