@@ -177,43 +177,78 @@ def fit_basic_ann_ensemble_wrapper(
         study_index_to_prob[original_index] = values
     
     return ensemble, fold_summed_test_loss, study_index_to_prob
-    
-def fit_basic_cvae_wrapper(
-        dataset_spec, 
-        train_data,
-        test_data,
-        test_indices,
-        hp
-    ):
-    """Train an ensemble of simple feed forward neural network classifiers and
-    return test predictions.
 
-    Given a dataset spec, training data, test data, test indices, and hyperparameters,
-    this function trains an ensemble of neural networks on the training data and 
-    returns the trained classifier, summed loss on the test data, and a dictionary
-    mapping study indices to predicted probabilities for the test data.
+def train_cvae(train_dl, device, hp):
+    """Train a Conditional Variational Autoencoder (CVAE).
 
     Args:
-        dataset_spec: DatasetSpec object describing the columns
-        train_data: TrainData tuple with (X_categorical, X_ordinal, X_numerical)
-        test_data: TestData tuple with (X_categorical, X_ordinal, X_numerical)
-        test_indices: List of study indices for test data 
-        hp: Dict with hyperparameters:
-            'batch_size': size of batches for model training
-            'num_x_var': number of input features
-            'hidden_sizes': list of number of neurons in each hidden layer
-            'dropout_prob': probability of zeroing activations in dropout layers
-            'num_models': number of models in the ensemble
-            'lr': initial learning rate
-            'final_lr': final learning rate for the exponential decay (use None for no decay)
-            'epochs': number of complete passes over the training dataset
-            'device': device for computation ('cpu' or 'cuda')
+        train_dl (DataLoader): DataLoader for the training data.
+        device (torch.device): The device to train the model on.
+        hp (dict): Hyperparameters for training.
 
     Returns:
-        ensemble: Trained EnsembleTorchModel object
-        fold_summed_test_loss: Total log loss on test data 
-        study_index_to_prob: Dict mapping study indices to predicted probabilities
-    
+        CMixedVAE: Trained CVAE model.
+    """
+    # Initialize the model and move to device
+    model = CMixedVAE(hp['cat_dims'],
+                      hp['ord_dims'],
+                      hp['num_dim'],
+                      hp['latent_dim'],
+                      hp['interior_dim'],
+                      hp['beta'],
+                      hp['dropout_prob']).to(device)
+
+    # Set up the optimizer
+    optimizer = torch.optim.Adam(model.parameters(), lr=hp['lr'])
+
+    # Initialize the progress bar
+    progress_bar = tqdm(range(hp['epochs']), desc="Training cVAE")
+
+    # Training loop
+    for epoch in progress_bar:
+        model.train()
+        train_loss = 0
+        for i, (Xcat, Xord, Xnum, Mnum,
+                cond_Xcat, cond_Xord, cond_Xnum, cond_Mnum,
+                recon_mask_cat, recon_mask_ord, recon_mask_num) in enumerate(train_dl):
+            # Move data to device
+            Xcat, Xord, Xnum, Mnum = Xcat.to(device), Xord.to(device), Xnum.to(device), Mnum.to(device)
+            cond_Xcat, cond_Xord, cond_Xnum, cond_Mnum = cond_Xcat.to(device), cond_Xord.to(device), cond_Xnum.to(device), cond_Mnum.to(device)
+
+            # Forward pass
+            recon_x, mu, logvar = model(Xcat, Xord, Xnum, Mnum,
+                                        cond_Xcat, cond_Xord, cond_Xnum, cond_Mnum)
+
+            # Compute loss
+            recon_masks = (recon_mask_cat.to(device),
+                           recon_mask_ord.to(device),
+                           recon_mask_num.to(device))
+            loss = model.vae_loss_function(recon_x, (Xcat, Xord, Xnum), mu, logvar, recon_masks)
+
+            # Backward pass and optimization
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            train_loss += loss.item()
+
+        # Update the progress bar
+        epoch_loss = train_loss / len(train_dl)
+        progress_bar.set_postfix({"epoch": epoch+1, "loss": epoch_loss})
+
+    return model
+
+def fit_cvae_wrapper(dataset_spec,
+                     train_data,
+                     test_data,
+                     test_indices,
+                     hp,
+                     device):
+    """Train a conditional variational autoencoder (CVAE)
+
+    TODO: finish documentation
+
+   
     """
     dataset_spec.y_var = None
     Xcat, Xord, Xnum = train_data
@@ -225,11 +260,12 @@ def fit_basic_cvae_wrapper(
                                        hp['aug_mult'])
     train_dl = DataLoader(train_ds, batch_size=hp['batch_size'], shuffle=True)
 
-    #Xcat0_test, Xord0_test, Xnum0_test = test_data
-    #mixed_dataset_test = MixedDataset(dataset_spec, Xcat0_test, Xord0_test, Xnum0_test)
-    #Xcat_test, Xord_test, Xnum_test, y_test = mixed_dataset_test.get_arrays()
-    # need to start indexing from 0
-    #test_dl = DataLoader(test_ds, batch_size=hp['batch_size'], shuffle=True)
+    # For test data, we explicitly do our own conditioning below
+    Xcat_test, Xord_test, Xnum_test = test_data
+    test_ds = MixedDataset(dataset_spec,
+                           Xcat_test,
+                           Xord_test,
+                           Xnum_test)
 
     base_model_args = (hp['cat_dims'],
                        hp['ord_dims'],
@@ -238,30 +274,44 @@ def fit_basic_cvae_wrapper(
                        hp['interior_dim'],
                        hp['beta'],
                        hp['dropout_prob'])
-    model = train_cvae
+
+    model = train_cvae(train_dl, device, hp)
 
     # Predict the probabilities for test data
-    num_obs = len(y_test)
+    #num_obs = len(test_indices)
+    # Condition on everything but Sex, which is what we want to predict
+    ind_sex = dataset_spec.get_ordered_variables('categorical').index('Sex')
+     
     with torch.no_grad():
-        test_input = torch.tensor(X_test, dtype=torch.float)
-        y_pred_prob = ensemble.predict_prob(test_input, hp['device']).cpu().numpy()
-    
-    # Calculate the test loss for this fold (multiply by the number of
-    # observations in this fold so that what we return is the total
-    # test loss)
-    #
-    # We input the labels just in case all the values in y_test are the
-    # same, which can lead to log_loss guessing incorrectly about how
-    # y_test is indexed.
-    fold_summed_test_loss = log_loss(y_test, y_pred_prob, labels=[0,1])*num_obs
-    assert len(test_indices) == num_obs
+        fold_summed_test_loss = 0
+        study_index_to_prob = dict()
+        for i, (Xcat_test, Xord_test, Xnum_test, Mnum_test) in enumerate(test_ds):
+            known_sex = Xcat_test[ind_sex].item()
+            assert known_sex in [1,2]
+            # set sex to missing
+            Xcat_test[ind_sex] = 0
 
-    study_index_to_prob = dict()
-    for i, original_index in enumerate(test_indices):
-        values = y_pred_prob[i,:]
-        study_index_to_prob[original_index] = values
+            # The conditioned variables simply equal the input variables, now
+            # that we've set sex to be missing
+            Xcat_test, Xord_test, Xnum_test, Mnum_test =\
+                Xcat_test.to(device), Xord_test.to(device), Xnum_test.to(device), Mnum_test.to(device)
+            cond_Xcat_test = Xcat_test
+            cond_Xord_test = Xord_test
+            cond_Xnum_test = Xnum_test
+            cond_Mnum_test = Mnum_test
+            # TODO: do we need to make conditionined variables equal their value in the loss calc during training?
+            recon_x, mu, logvar = model(Xcat_test, Xord_test, Xnum_test, Mnum_test,
+                                        cond_Xcat_test, cond_Xord_test, cond_Xnum_test, cond_Mnum_test)
+            pred_sex_logits = recon_x[0][ind_sex].cpu().numpy()
+            pred_sex_prob = np.exp(pred_sex_logits)
+            pred_sex_prob = pred_sex_prob / np.sum(pred_sex_prob)
+            # TODO: we could ensemble models here
+            fold_summed_test_loss += log_loss([known_sex], pred_sex_prob, labels=[1,2])
+
+            original_index = test_indices[i]
+            study_index_to_prob[original_index] = pred_sex_prob[0]
     
-    return ensemble, fold_summed_test_loss, study_index_to_prob
+    return model, fold_summed_test_loss, study_index_to_prob
 
 
    
@@ -333,7 +383,12 @@ def cross_validate(dataset_spec,
         elif model_type.lower() == 'cvae':
             # Use the wrapper function to fit the a CVAE
             _, fold_summed_test_loss, fold_study_index_to_prob =\
-                fit_basic_cvae_wrapper(dataset_spec, train_data, test_data, test_indices, hp)
+                fit_cvae_wrapper(dataset_spec,
+                                 train_data,
+                                 test_data,
+                                 test_indices,
+                                 hp,
+                                 device)
         else:
             raise Exception(f'Unrecognized model_type = {model_type}')
 
@@ -627,29 +682,40 @@ class CMixedVAE(nn.Module):
     """
     Conditional Variational Autoencoder (CVAE) for mixed data.
 
-    This module defines a CVAE that handles mixed data consisting of categorical, ordinal and numerical variables.
-    It also supports conditioning on one or more of these variables. Masked variables are supported.
+    This class represents a Conditional Variational Autoencoder that is capable of handling mixed data. This includes
+    categorical, ordinal, and numerical variables. The model also supports conditioning on one or more of these variables.
+    Masked variables are supported as well.
 
-    Parameters:
-    cat_dims (list): List of dimensions for each categorical variable.
-    ord_dims (list): List of dimensions for each ordinal variable.
-    num_dim (int): Dimension of numerical variable.
-    latent_dim (int): Dimension of latent space.
-    interior_dim (int): Dimension of intermediate layer in encoder and decoder.
-    beta (float): Weighting factor for the KL Divergence in the loss.
-    dropout_prob (float, optional): Probability of dropout. Defaults to 0.5.
+    Attributes:
+        cat_dims (list): List of dimensions for each categorical variable.
+        ord_dims (list): List of dimensions for each ordinal variable.
+        num_dim (int): Dimension of numerical variable.
+        latent_dim (int): Dimension of latent space.
+        interior_dim (int): Dimension of intermediate layer in encoder and decoder.
+        beta (float): Weighting factor for the KL Divergence in the loss.
+        dropout_prob (float): Probability of dropout.
     """
 
-    def __init__(self, cat_dims, ord_dims, num_dim,
-                 latent_dim, interior_dim,
-                 beta, dropout_prob=0.5):
+    def __init__(self, cat_dims, ord_dims, num_dim, latent_dim, interior_dim, beta, dropout_prob=0.5):
+        """
+        Initializes the CMixedVAE instance and sets up the necessary layers.
+
+        Args:
+            cat_dims (list): List of dimensions for each categorical variable.
+            ord_dims (list): List of dimensions for each ordinal variable.
+            num_dim (int): Dimension of numerical variable.
+            latent_dim (int): Dimension of latent space.
+            interior_dim (int): Dimension of intermediate layer in encoder and decoder.
+            beta (float): Weighting factor for the KL Divergence in the loss.
+            dropout_prob (float, optional): Probability of dropout. Defaults to 0.5.
+        """
         super(CMixedVAE, self).__init__()
 
         self.cat_dims = cat_dims
         self.ord_dims = ord_dims
         self.num_dim = num_dim
 
-        self.input_dim = len(cat_dims) + len(ord_dims) + 2*num_dim
+        self.input_dim = len(cat_dims) + len(ord_dims) + 2 * num_dim
         self.beta = beta
 
         # Dropout layer
@@ -662,47 +728,128 @@ class CMixedVAE(nn.Module):
 
         # Decoder
         self.fc3 = nn.Linear(latent_dim + self.input_dim, interior_dim)  # Add input dimension
-        self.fc4 = nn.Linear(interior_dim, sum(cat_dims)+sum(ord_dims)+num_dim)
+        self.fc4 = nn.Linear(interior_dim, sum(cat_dims) + sum(ord_dims) + num_dim)
 
     def encode(self, x_m):
-        # The conditioned variables are already in the stacked
-        # x-variable / mask input
-        h = self.dropout(torch.relu(self.fc1(torch.cat([x_m, c], dim=-1))))  # Concatenate condition variables
+        """
+        Encodes the input into a mean and log variance representation.
+
+        Args:
+            x_m (torch.Tensor): Input tensor containing stacked x-variable / mask input.
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor]: The means and log variance of the latent distribution.
+        """
+        h = self.dropout(torch.relu(self.fc1(x_m)))  # Concatenate condition variables
         return self.fc21(h), self.fc22(h)
 
     def reparameterize(self, mu, logvar):
-        std = torch.exp(0.5*logvar)
+        """
+        Performs the reparameterization trick to sample from the latent space.
+
+        Args:
+            mu (torch.Tensor): The means of the latent distribution.
+            logvar (torch.Tensor): The log variances of the latent distribution.
+
+        Returns:
+            torch.Tensor: The sampled latent variables.
+        """
+        std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
-        return mu + eps*std
+        return mu + eps * std
 
     def decode(self, z, cond_x_m):
+        """
+        Decodes the latent variables back into the original space.
+
+        Args:
+            z (torch.Tensor): The latent variables.
+            cond_x_m (torch.Tensor): Input tensor containing condition variables.
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor]: The reconstructed categorical, ordinal, and numerical variables.
+        """
         h = self.dropout(torch.relu(self.fc3(torch.cat([z, cond_x_m], dim=-1))))  # Concatenate condition variables
         out = self.fc4(h)
         recon_cat = torch.split(out[:, :sum(self.cat_dims)], self.cat_dims, dim=1)
-        recon_ord = torch.split(out[:, sum(self.cat_dims):sum(self.cat_dims)+sum(self.ord_dims)], self.ord_dims, dim=1)
+        recon_ord = torch.split(out[:, sum(self.cat_dims):sum(self.cat_dims) + sum(self.ord_dims)], self.ord_dims, dim=1)
         recon_num = out[:, -self.num_dim:]
         return recon_cat, recon_ord, recon_num
 
-    def forward(self, x_cat, x_ord, x_num, m_num, cond_x_cat, cond_x_ord, cond_x_num, cond_m_num):  # Add condition variables
+    def forward(self, x_cat, x_ord, x_num, m_num, cond_x_cat, cond_x_ord, cond_x_num, cond_m_num):
+        """
+        Defines the forward pass of the CVAE.
+
+        Args:
+            x_cat (torch.Tensor): The categorical input tensor.
+            x_ord (torch.Tensor): The ordinal input tensor.
+            x_num (torch.Tensor): The numerical input tensor.
+            m_num (torch.Tensor): The numerical mask tensor.
+            cond_x_cat (torch.Tensor): The categorical condition tensor.
+            cond_x_ord (torch.Tensor): The ordinal condition tensor.
+            cond_x_num (torch.Tensor): The numerical condition tensor.
+            cond_m_num (torch.Tensor): The numerical condition mask tensor.
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor]: The reconstructed categorical, ordinal, and numerical variables.
+            tuple[torch.Tensor, torch.Tensor]: The means and log variances of the latent distribution.
+        """
+
+        # Check if the input tensors have a batch dimension; if not, add it
+        if x_cat is not None and len(x_cat.shape) == 1:
+            x_cat = x_cat.unsqueeze(0)
+        if x_ord is not None and len(x_ord.shape) == 1:
+            x_ord = x_ord.unsqueeze(0)
+        if x_num is not None and len(x_num.shape) == 1:
+            x_num = x_num.unsqueeze(0)
+        if m_num is not None and len(m_num.shape) == 1:
+            m_num = m_num.unsqueeze(0)
+        if cond_x_cat is not None and len(cond_x_cat.shape) == 1:
+            cond_x_cat = cond_x_cat.unsqueeze(0)
+        if cond_x_ord is not None and len(cond_x_ord.shape) == 1:
+            cond_x_ord = cond_x_ord.unsqueeze(0)
+        if cond_x_num is not None and len(cond_x_num.shape) == 1:
+            cond_x_num = cond_x_num.unsqueeze(0)
+        if cond_m_num is not None and len(cond_m_num.shape) == 1:
+            cond_m_num = cond_m_num.unsqueeze(0)
+
         x = torch.cat([x_cat, x_ord, x_num], dim=-1)
         m = torch.cat([m_num], dim=-1)
-        c = torch.cat([cond_x_cat, cond_x_ord, cond_x_num, cond_m_num], dim=-1)
-        mu, logvar = self.encode(torch.cat([x, m], dim=-1), c)  # Pass condition variables
+        cond_x = torch.cat([cond_x_cat, cond_x_ord, cond_x_num, cond_m_num], dim=-1)
+        #cond_m = torch.cat([cond_m_num], dim=-1)
+        mu, logvar = self.encode(torch.cat([x, m], dim=-1))
         z = self.reparameterize(mu, logvar)
-        recon_cat, recon_ord, recon_num = self.decode(z, c)  # Pass condition variables
-        return (recon_cat, recon_ord, recon_num), mu, logvar, c
+        recon_cat, recon_ord, recon_num = self.decode(z, cond_x)
+        return (recon_cat, recon_ord, recon_num), mu, logvar
 
-    def vae_loss_function(self, recon_x, x, mask, mu, logvar, c):
+    def vae_loss_function(self, recon_x, x, mu, logvar, recon_masks):
+        """
+        Defines the VAE loss function, including the reconstruction loss and the KL divergence.
+
+        Args:
+            recon_x (tuple): The reconstructed output of the VAE.
+            x (tuple): The input tensors for the VAE (x_cat, x_ord, and x_num)
+            mu (torch.Tensor): The means of the latent distribution.
+            logvar (torch.Tensor): The log variances of the latent distribution.
+            recon_masks (tuple): The binary reconstruction mask tensors where True indicates reconstruction required and
+                                 False indicates no reconstruction.
+
+        Returns:
+            torch.Tensor: The total loss of the VAE.
+        """
         recon_cat, recon_ord, recon_num = recon_x
         x_cat, x_ord, x_num = x
-        m_cat, m_ord, m_num = mask
+        recon_mask_cat, recon_mask_ord, recon_mask_num = recon_masks
 
         # Cross entropy for categorical and ordinal variables
-        CE_cat = compute_masked_vae_cross_entropy(recon_cat, x_cat, m_cat, c)
-        CE_ord = compute_masked_vae_cross_entropy(recon_ord, x_ord, m_ord, c)
+        # For ordinal and categorical variables, a value of 0 indicates a mask
+        # missing. For numerical variables, this is indicated by m_num. This
+        # should already have been accounted for in the reconstruction masks.
+        CE_ord = compute_masked_vae_cross_entropy(recon_ord, x_ord, recon_mask_ord)
+        CE_cat = compute_masked_vae_cross_entropy(recon_cat, x_cat, recon_mask_cat)
 
         # Masked Mean Squared Error for numerical variables
-        MSE_num = (m_num * (x_num - recon_num)**2).sum() / m_num.sum()
+        MSE_num = (recon_mask_num * (x_num - recon_num)**2).sum() / recon_mask_num.sum()
 
         # Overall loss
         loss = CE_cat + CE_ord + MSE_num
@@ -712,6 +859,50 @@ class CMixedVAE(nn.Module):
 
         return loss + self.beta * KLD
 
+def compute_masked_vae_cross_entropy(recon, x, recon_mask):
+    """
+    Compute masked cross entropy loss where recon_mask indicates what to reconstruct.
+
+    Args:
+        recon (torch.Tensor): The reconstructed output of the VAE.
+        x (torch.Tensor): The input tensor for the VAE.
+        recon_mask (torch.Tensor): The binary mask tensor where True indicates
+                                   reconstruction required and False indicates
+                                   no reconstruction.
+
+    Returns:
+        torch.Tensor: The masked cross entropy loss, averaged over unmasked
+                      elements. None if all elements are masked.
+    """
+    batch_size = x.shape[0]
+    already_init = False
+    mask_count = 0
+    CE = None
+    # Let num_var be the number of variables and batch_size the batch size. Then:
+    # len(recon) = num_var
+    # recon[i].shape = (batch_size, num_cat_i)
+    # x.shape = recon_mask.shape = batch_size x num_var
+    for b in range(batch_size):
+        for i in range(x.shape[1]):
+            # If recon_mask is True for this variab le and observation, include
+            # it in the loss
+            if recon_mask[b, i]:
+                known = x[b, i] - 1
+                # TODO: consider making x be long to start with
+                known = known.long()
+                pred = recon[i][b, :]
+                mask_count += 1
+                if not already_init:
+                    CE = torch.nn.functional.cross_entropy(pred, known)
+                    already_init = True
+                else:
+                    CE += torch.nn.functional.cross_entropy(pred, known)
+
+    if CE is None or mask_count == 0:
+        return None
+
+    CE = CE / mask_count
+    return CE
 
 def check_conditioning_vars(mask, conditioning_vars):
     """
@@ -731,50 +922,6 @@ def check_conditioning_vars(mask, conditioning_vars):
     for var in conditioning_vars:
         if mask[var] == 0:  # if variable is masked
             raise ValueError(f"Conditioning variable {var} is masked.")
-
-
-def compute_masked_vae_cross_entropy(recon, x, m, conditioning_vars=None):
-    """
-    Compute masked cross entropy loss for VAEs with optional conditioning.
-
-    Parameters:
-    recon (torch.Tensor): The reconstructed output of the VAE.
-    x (torch.Tensor): The input tensor for the VAE.
-    m (torch.Tensor): The binary mask tensor where True indicates valid and False indicates masked.
-    conditioning_vars (list, optional): The list of indices of variables to condition on. Defaults to None.
-
-    Returns:
-    torch.Tensor: The masked cross entropy loss, averaged over unmasked elements. None if all elements are masked.
-
-    Notes:
-    When conditioning_vars is specified, the cross entropy for those variables is not calculated.
-    """
-    
-    batch_size = x.shape[0]
-    already_init = False
-    mask_count = 0
-    CE = None
-    for b in range(batch_size):
-        for i in range(x.shape[1]):
-            # If conditioning_vars is specified and this variable is conditioned, skip it
-            if conditioning_vars is not None and i in conditioning_vars:
-                continue
-            # The mask is True if we use this observation
-            if m[b,i]:
-                known = x[b,i] - 1
-                pred = recon[i][b,:]
-                mask_count += 1
-                if not already_init:
-                    CE = torch.nn.functional.cross_entropy(pred, known)
-                    already_init = True
-                else:
-                    CE += torch.nn.functional.cross_entropy(pred, known)
-
-    if CE is None or mask_count == 0:
-        return None
-
-    CE = CE / mask_count
-    return CE
 
 
 class ConditionedMixedDataset(Dataset):
@@ -802,11 +949,11 @@ class ConditionedMixedDataset(Dataset):
             mask_prob (float): The probability of masking an input variable.
             aug_mult (int): The augmentation multiplier.
         """
+        assert dataset_spec.y_var is None
         self.mixed_dataset = MixedDataset(dataset_spec,
                                           Xcat=Xcat,
                                           Xord=Xord,
                                           Xnum=Xnum,
-                                          y_data=None,
                                           mask_prob=mask_prob,
                                           aug_mult=aug_mult,
                                           require_input=True)
@@ -825,68 +972,76 @@ class ConditionedMixedDataset(Dataset):
         Given an index, retrieves the corresponding item from the
         ConditionedMixedDataset. The item is a list consisting of corresponding
         elements (rows) from Xcat, Xord, Xnum, and their conditioned versions.
-
+    
         Args:
             idx (int): The index of the item to be fetched.
-
+    
         Returns:
-            tuple: A tuple of length 8 containing Xcat, Xord, Xnum, and Mnum
-                   along with their conditioned versions
+            tuple: A tuple of length 11 containing Xcat, Xord, Xnum, and Mnum
+                   along with their conditioned versions, and their corresponding 
+                   reconstruction masks for categorical, ordinal, and numerical variables.
         """
         # Retrieve the item from mixed_dataset with artificial masking
         Xcat, Xord, Xnum, Mnum = self.mixed_dataset[idx]
-
+    
         # Create conditioned copies
         cond_Xcat = Xcat.clone() if Xcat is not None else None
         cond_Xord = Xord.clone() if Xord is not None else None
         cond_Xnum = Xnum.clone() if Xnum is not None else None
         cond_Mnum = Mnum.clone() if Mnum is not None else None
-
+    
+        # Initialize reconstruction masks
+        recon_mask_cat = torch.zeros_like(cond_Xcat, dtype=torch.bool) if Xcat is not None else None
+        recon_mask_ord = torch.zeros_like(cond_Xord, dtype=torch.bool) if Xord is not None else None
+        recon_mask_num = torch.zeros_like(cond_Mnum, dtype=torch.bool) if Xnum is not None else None
+    
         # Combine datasets and conditioned versions for iteration
-        datasets = [(Xcat, cond_Xcat, 'cat'), (Xord, cond_Xord, 'ord'), (Xnum, cond_Xnum, 'num')]
+        datasets = [(Xcat, cond_Xcat, 'cat', recon_mask_cat), 
+                    (Xord, cond_Xord, 'ord', recon_mask_ord), 
+                    (Xnum, cond_Xnum, 'num', recon_mask_num)]
         masks = [None, None, Mnum]
-
+    
         # Determine the non-masked variables across all variable types
-        # The following for loop creates a list of indices of non-masked
-        # elements (the indexing is relative to each variable type),
-        # non_masked_indices and corresponding variable type, variable_types.
-        # The two lists have the same length.
         non_masked_indices = []
         variable_types = []
-        for (X, _, type_id), mask in zip(datasets, masks):
+        for (X, _, type_id, _), mask in zip(datasets, masks):
             if X is not None:
                 if type_id == 'num':  # For numerical variables, use mask to identify unmasked variables
                     X_non_masked_indices = mask
                 else:  # For categorical and ordinal variables, a non-zero value indicates an unmasked variable
                     X_non_masked_indices = (X != 0)
-
+    
                 # Append indices of non-masked variables and their types
                 non_masked_indices.extend(np.where(X_non_masked_indices)[0].tolist())
-                variable_types.extend([type_id] * np.sum(X_non_masked_indices))
-
+                variable_types.extend([type_id] * torch.sum(X_non_masked_indices).item())
+    
         num_not_masked = len(non_masked_indices)  # Count of non-masked variables across all variable types
-
+    
+        # TODO: add a switch to support never conditioning
         if num_not_masked > 0:
             # Randomly choose the number of variables to condition on.
-            # There must always be at least one non-conditioned variable.
             num_condition = np.random.randint(1, num_not_masked+1)
-
+    
             # Randomly choose which variables to condition on across all variable types
             condition_indices = np.random.choice(range(num_not_masked),
                                                  size=num_condition,
                                                  replace=False)
-
-            # Set all non-conditioned variables as masked in the copied dataset
+    
+            # Set all non-conditioned variables as masked in the copied dataset (for the recon mask)
             non_condition_indices = [index for index in range(num_not_masked) if index not in condition_indices]
             for non_condition_index in non_condition_indices:
                 if variable_types[non_condition_index] == 'cat':
                     cond_Xcat[non_masked_indices[non_condition_index]] = 0
+                    recon_mask_cat[non_masked_indices[non_condition_index]] = True
                 elif variable_types[non_condition_index] == 'ord':
                     cond_Xord[non_masked_indices[non_condition_index]] = 0
+                    recon_mask_ord[non_masked_indices[non_condition_index]] = True
                 else:  # 'num'
                     assert variable_types[non_condition_index] == 'num'
                     cond_Xnum[non_masked_indices[non_condition_index]] = 0
                     cond_Mnum[non_masked_indices[non_condition_index]] = False
-
-        # Return original and conditioned datasets
-        return Xcat, Xord, Xnum, Mnum, cond_Xcat, cond_Xord, cond_Xnum, cond_Mnum
+                    recon_mask_num[non_masked_indices[non_condition_index]] = True
+    
+        # Return original and conditioned datasets along with reconstruction masks
+        return (Xcat, Xord, Xnum, Mnum, cond_Xcat, cond_Xord, cond_Xnum, cond_Mnum, 
+                recon_mask_cat, recon_mask_ord, recon_mask_num)
