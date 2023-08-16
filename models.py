@@ -211,9 +211,9 @@ def train_cvae(train_dl, device, hp):
         for i, (Xcat, Xord, Xnum, Mnum,
                 cond_Xcat, cond_Xord, cond_Xnum, cond_Mnum,
                 recon_mask_cat, recon_mask_ord, recon_mask_num) in enumerate(train_dl):
-            # Move data to device
-            Xcat, Xord, Xnum, Mnum = Xcat.to(device), Xord.to(device), Xnum.to(device), Mnum.to(device)
-            cond_Xcat, cond_Xord, cond_Xnum, cond_Mnum = cond_Xcat.to(device), cond_Xord.to(device), cond_Xnum.to(device), cond_Mnum.to(device)
+            # Move data to device (double check it is no longer necessary to move arrays to the device)
+            #Xcat, Xord, Xnum, Mnum = Xcat.to(device), Xord.to(device), Xnum.to(device), Mnum.to(device)
+            #cond_Xcat, cond_Xord, cond_Xnum, cond_Mnum = cond_Xcat.to(device), cond_Xord.to(device), cond_Xnum.to(device), cond_Mnum.to(device)
 
             # Forward pass
             recon_x, mu, logvar = model(Xcat, Xord, Xnum, Mnum,
@@ -252,20 +252,34 @@ def fit_cvae_wrapper(dataset_spec,
     """
     dataset_spec.y_var = None
     Xcat, Xord, Xnum = train_data
+
+    # The matrices are torch tensors, but ConditionedMixedDataset needs
+    # numpy arrays.
+    # TODO: consider supporting both torch tensors and numpy arrays in ConditionedMixedDataset
+    Xcat = Xcat.cpu().numpy()
+    Xord = Xord.cpu().numpy()
+    Xnum = Xnum.cpu().numpy()
+
     train_ds = ConditionedMixedDataset(dataset_spec,
                                        Xcat,
                                        Xord,
                                        Xnum,
                                        hp['mask_prob'],
-                                       hp['aug_mult'])
+                                       hp['aug_mult'],
+                                       device=device.type) # device.type is a string like 'cuda' or 'cpu'
     train_dl = DataLoader(train_ds, batch_size=hp['batch_size'], shuffle=True)
 
     # For test data, we explicitly do our own conditioning below
     Xcat_test, Xord_test, Xnum_test = test_data
+    Xcat_test = Xcat_test.cpu().numpy()
+    Xord_test = Xord_test.cpu().numpy()
+    Xnum_test = Xnum_test.cpu().numpy()
+
     test_ds = MixedDataset(dataset_spec,
                            Xcat_test,
                            Xord_test,
-                           Xnum_test)
+                           Xnum_test,
+                           device=device.type)
 
     base_model_args = (hp['cat_dims'],
                        hp['ord_dims'],
@@ -937,7 +951,7 @@ class ConditionedMixedDataset(Dataset):
     """
 
     def __init__(self, dataset_spec, Xcat=None, Xord=None, Xnum=None,
-                 mask_prob=0.0, aug_mult=1):
+                 mask_prob=0.0, aug_mult=1, device='cpu'):
         """
         Constructs the ConditionedMixedDataset.
 
@@ -956,7 +970,8 @@ class ConditionedMixedDataset(Dataset):
                                           Xnum=Xnum,
                                           mask_prob=mask_prob,
                                           aug_mult=aug_mult,
-                                          require_input=True)
+                                          require_input=True,
+                                          device=device)
 
     def __len__(self):
         """
@@ -1012,7 +1027,8 @@ class ConditionedMixedDataset(Dataset):
                     X_non_masked_indices = (X != 0)
     
                 # Append indices of non-masked variables and their types
-                non_masked_indices.extend(np.where(X_non_masked_indices)[0].tolist())
+                #non_masked_indices.extend(np.where(X_non_masked_indices)[0].tolist())
+                non_masked_indices.extend(torch.nonzero(X_non_masked_indices).squeeze().tolist())
                 variable_types.extend([type_id] * torch.sum(X_non_masked_indices).item())
     
         num_not_masked = len(non_masked_indices)  # Count of non-masked variables across all variable types

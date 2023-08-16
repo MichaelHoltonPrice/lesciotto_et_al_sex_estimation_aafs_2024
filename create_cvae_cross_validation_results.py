@@ -8,8 +8,8 @@ from mixalot.datasets import MixedDataset
 
 def main():
 
-    num_folds = 7
-    #num_folds = 35
+    #num_folds = 7
+    num_folds = 35
     fold_seed = 884683
     obs1_data, obs2_data, num_scalers,\
         obs1_folds, obs2_folds, fold_test_indices, dataset_spec =\
@@ -31,8 +31,8 @@ def main():
           'cat_dims': cat_dims,
           'ord_dims': ord_dims,
           'num_dim': num_dim,
-          'latent_dim': 8,
-          'interior_dim': 64,
+          'latent_dim': 4,
+          'interior_dim': 256,
           'mask_prob': 0.0,
           'aug_mult': 1,
           'beta': 1.0,
@@ -45,7 +45,8 @@ def main():
           'fold_seed': fold_seed}
  
     # If possible, use the GPU. Otherwise, use the CPU
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    #device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cpu')
 
     obs1_overall_test_loss, obs1_prob_matrix =\
         cross_validate(dataset_spec,
