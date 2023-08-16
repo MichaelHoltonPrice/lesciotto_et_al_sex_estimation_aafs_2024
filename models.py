@@ -1028,7 +1028,9 @@ class ConditionedMixedDataset(Dataset):
     
                 # Append indices of non-masked variables and their types
                 #non_masked_indices.extend(np.where(X_non_masked_indices)[0].tolist())
-                non_masked_indices.extend(torch.nonzero(X_non_masked_indices).squeeze().tolist())
+                #non_masked_indices.extend(torch.nonzero(X_non_masked_indices).squeeze().tolist())
+                non_masked_indices.extend(torch.where(X_non_masked_indices)[0].cpu().tolist())
+
                 variable_types.extend([type_id] * torch.sum(X_non_masked_indices).item())
     
         num_not_masked = len(non_masked_indices)  # Count of non-masked variables across all variable types
@@ -1036,12 +1038,15 @@ class ConditionedMixedDataset(Dataset):
         # TODO: add a switch to support never conditioning
         if num_not_masked > 0:
             # Randomly choose the number of variables to condition on.
-            num_condition = np.random.randint(1, num_not_masked+1)
+            #num_condition = np.random.randint(1, num_not_masked+1)
     
             # Randomly choose which variables to condition on across all variable types
-            condition_indices = np.random.choice(range(num_not_masked),
-                                                 size=num_condition,
-                                                 replace=False)
+            #condition_indices = np.random.choice(range(num_not_masked),
+            #                                     size=num_condition,
+            #                                     replace=False)
+            
+            num_condition = torch.randint(1, num_not_masked+1, (1,)).item()
+            condition_indices = torch.randperm(num_not_masked)[:num_condition].cpu().numpy()
     
             # Set all non-conditioned variables as masked in the copied dataset (for the recon mask)
             non_condition_indices = [index for index in range(num_not_masked) if index not in condition_indices]

@@ -45,8 +45,8 @@ def main():
           'fold_seed': fold_seed}
  
     # If possible, use the GPU. Otherwise, use the CPU
-    #device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    device = torch.device('cpu')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    #device = torch.device('cpu')
 
     obs1_overall_test_loss, obs1_prob_matrix =\
         cross_validate(dataset_spec,
