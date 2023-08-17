@@ -44,9 +44,9 @@ def main():
           'num_folds': num_folds,
           'fold_seed': fold_seed}
  
-    # If possible, use the GPU. Otherwise, use the CPU
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    #device = torch.device('cpu')
+    # For some reason, it's about 5 times faster to use the CPU on my current machine
+    #device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cpu')
 
     obs1_overall_test_loss, obs1_prob_matrix =\
         cross_validate(dataset_spec,
@@ -63,15 +63,26 @@ def main():
     
     # Add back the y-variable in dataset_spec
     dataset_spec.y_var = 'Sex'
-    y_data = MixedDataset(dataset_spec, obs1_data[0], obs1_data[1], obs1_data[2]).y_data
-    assert np.all(MixedDataset(dataset_spec, obs2_data[0], obs2_data[1], obs2_data[2]).y_data == y_data)
+    # TODO: remove .cpu().numpy() if and when MixedDataset can accept torch tensors in __init__
+    y_data1 = MixedDataset(dataset_spec,
+                           obs1_data[0].cpu().numpy(),
+                           obs1_data[1].cpu().numpy(),
+                           obs1_data[2].cpu().numpy()).y_data
+    y_data1 =  y_data1.cpu().numpy()
+    y_data2 = MixedDataset(dataset_spec,
+                           obs2_data[0].cpu().numpy(),
+                           obs2_data[1].cpu().numpy(),
+                           obs2_data[2].cpu().numpy()).y_data
+    y_data2 =  y_data2.cpu().numpy()
+ 
+    assert np.all(y_data1 == y_data2)
     
     save_cross_validation_results(os.path.join('outputs', 'cvae'),
                                   obs1_overall_test_loss,
                                   obs1_prob_matrix,
                                   obs2_overall_test_loss,
                                   obs2_prob_matrix,
-                                  y_data,
+                                  y_data1,
                                   hp)
  
 if __name__ == '__main__':
