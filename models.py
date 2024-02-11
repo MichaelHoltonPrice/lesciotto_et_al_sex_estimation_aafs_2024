@@ -49,11 +49,13 @@ def fit_random_forest_wrapper(
     Xcat0, Xord0, Xnum0 = train_data
     mixed_dataset = MixedDataset(dataset_spec, Xcat0, Xord0, Xnum0)
     Xcat, Xord, Xnum, y = mixed_dataset.get_arrays()
-    X = np.hstack([Xcat, Xord, Xnum])
+    assert Xcat is None
+    X = np.hstack([Xord, Xnum])
 
     Xcat0_test, Xord0_test, Xnum0_test = test_data
     mixed_dataset_test = MixedDataset(dataset_spec, Xcat0_test, Xord0_test, Xnum0_test)
     Xcat_test, Xord_test, Xnum_test, y_test = mixed_dataset_test.get_arrays()
+    assert Xcat_test is None
 
     # TODO: consider supporting imputation here
 
@@ -62,7 +64,7 @@ def fit_random_forest_wrapper(
     clf.fit(X, y)
 
     # Predict the probabilities for test data
-    X_test = np.hstack([Xcat_test, Xord_test, Xnum_test])
+    X_test = np.hstack([Xord_test, Xnum_test])
     y_pred_prob = clf.predict_proba(X_test)
     num_obs = y_pred_prob.shape[0]
 
@@ -73,6 +75,8 @@ def fit_random_forest_wrapper(
     # We input the labels just in case all the values in y_test are the
     # same, which can lead to log_loss guessing incorrectly about how
     # y_test is indexed.
+    # Apparently the predicted proabilities can be close to one when summed
+    # but not close enough for log_loss; sometimes a warning is thrown.
     fold_summed_test_loss = log_loss(y_test, y_pred_prob, labels=clf.classes_)*num_obs
     assert len(test_indices) == num_obs
 
@@ -130,16 +134,20 @@ def fit_basic_ann_ensemble_wrapper(
     Xcat, Xord, Xnum, y = mixed_dataset.get_arrays()
     # need to start indexing from 0
     y = [k-1 for k in y]
-    X = np.hstack([Xcat, Xord, Xnum])
+
+    assert Xcat is None
+    X = np.hstack([Xord, Xnum])
     train_ds = InputTargetDataset(X,y)
     train_dl = DataLoader(train_ds, batch_size=hp['batch_size'], shuffle=True)
 
     Xcat0_test, Xord0_test, Xnum0_test = test_data
     mixed_dataset_test = MixedDataset(dataset_spec, Xcat0_test, Xord0_test, Xnum0_test)
     Xcat_test, Xord_test, Xnum_test, y_test = mixed_dataset_test.get_arrays()
+    assert Xcat_test is None
+
     # need to start indexing from 0
     y_test = [k-1 for k in y_test]
-    X_test = np.hstack([Xcat_test, Xord_test, Xnum_test])
+    X_test = np.hstack([Xord_test, Xnum_test])
     test_ds = InputTargetDataset(X_test,y_test)
     test_dl = DataLoader(test_ds, batch_size=hp['batch_size'], shuffle=True)
 
