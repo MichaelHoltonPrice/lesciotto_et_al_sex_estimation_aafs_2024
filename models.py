@@ -11,7 +11,190 @@ from torch.utils.data import Dataset
 from torch.nn import CrossEntropyLoss
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import LambdaLR
-#from typing import Tuple, List, Dict
+from typing import List, Optional, Dict, Tuple
+from mixalot.datasets import DatasetSpec
+
+
+class AAFSDataset(Dataset):
+    """
+    A mixed dataset that handles missing values. It is a simplification of
+    mixalot.datasets.MixedDataset, which can also handle data augmentation
+    and randomized masking.
+
+    Args:
+        dataset_spec (DatasetSpec): Specification of the dataset.
+        Xcat (np.ndarray, optional): Numpy array holding categorical data.
+        Xord (np.ndarray, optional): Numpy array holding ordinal data.
+        Xnum (np.ndarray, optional): Numpy array holding numerical data.
+        device (torch.device or str, optional): The torch device object or string to specify the device to use. Default is 'cpu'.
+
+    Attributes:
+        dataset_spec (DatasetSpec): Specification of the dataset.
+        Xcat (np.ndarray): Categorical data.
+        Xord (np.ndarray): Ordinal data.
+        Xnum (np.ndarray): Numerical data.
+        y_data (np.ndarray): y variable data.
+        num_obs (int): Number of observations in the dataset.
+        require_input (bool): If True, ensures that at least one variable remains unmasked in every item. Default is False.
+    """
+    def __init__(self,
+                 dataset_spec: 'DatasetSpec',
+                 Xcat: Optional[np.ndarray] = None,
+                 Xord: Optional[np.ndarray] = None,
+                 Xnum: Optional[np.ndarray] = None,
+                 device=None):
+
+        self.dataset_spec = dataset_spec
+        self.device = torch.device('cpu') if device is None else torch.device(device)
+
+        if Xcat is None and Xord is None and Xnum is None:
+            raise ValueError("Xcat, Xord, and Xnum cannot all be None")
+
+        # Convert tensors to numpy if they are tensors. While this is mildly inefficient
+        # (since they are ultimately converted to tensors below) it does make the code easier
+        # to understand and maintain.
+        Xcat = Xcat.cpu().numpy() if isinstance(Xcat, torch.Tensor) else Xcat
+        Xord = Xord.cpu().numpy() if isinstance(Xord, torch.Tensor) else Xord
+        Xnum = Xnum.cpu().numpy() if isinstance(Xnum, torch.Tensor) else Xnum
+
+        # Create a mask for Xnum, which is True/1 where Xnum is NaN and False/0 otherwise. We do not
+        # need masks for Xcat and Xord because they a missing value is indicated by 0.
+        # TODO: is this convention of False for NaN correct? I think different packages/methods
+        #       make a different choice for this.
+        self.Xnum_mask = torch.tensor(np.isnan(Xnum), dtype=torch.bool, device=self.device) if Xnum is not None else None
+
+        # Replace any nan with 0 in Xnum
+        Xnum = np.where(np.isnan(Xnum), 0, Xnum)
+
+        num_obs_list = {len(X) for X in [Xcat, Xord, Xnum] if X is not None}
+        if len(num_obs_list) > 1:
+            raise ValueError("Input arrays do not have the same number of samples")
+        self.num_obs = num_obs_list.pop()
+
+        # Ensure that each input has the correct number of columns
+        for var_type, X, s in zip(['categorical', 'ordinal', 'numerical'],
+                                  [Xcat, Xord, Xnum],
+                                  ['Xcat', 'Xord', 'Xnum']):
+            num_var_ds = len(dataset_spec.get_ordered_variables(var_type))
+            if X is None:
+                num_var_mat = 0
+            else:
+                num_var_mat = X.shape[1]
+
+            if num_var_ds != num_var_mat:
+                raise ValueError(f'{s} has {num_var_mat} columns but dataset_spec has {num_var_ds} {var_type} variables')
+
+        # Extract y_data before converting to tensor and moving to device
+        if dataset_spec.y_var is not None:
+            if dataset_spec.y_var in dataset_spec.get_ordered_variables('categorical'):
+                y_var_type = 'categorical'
+                y_idx = dataset_spec.get_ordered_variables('categorical').index(dataset_spec.y_var)
+                self.y_data = Xcat[:, y_idx].copy()
+                Xcat = np.delete(Xcat, y_idx, axis=1) if Xcat.shape[1] > 1 else None
+            elif dataset_spec.y_var in dataset_spec.get_ordered_variables('ordinal'):
+                y_var_type = 'ordinal'
+                y_idx = dataset_spec.get_ordered_variables('ordinal').index(dataset_spec.y_var)
+                self.y_data = Xord[:, y_idx].copy()
+                Xord = np.delete(Xord, y_idx, axis=1) if Xord.shape[1] > 1 else None
+            elif dataset_spec.y_var in dataset_spec.get_ordered_variables('numerical'):
+                y_var_type = 'numerical'
+                y_idx = dataset_spec.get_ordered_variables('numerical').index(dataset_spec.y_var)
+                self.y_data = Xnum[:, y_idx].copy()
+                Xnum = np.delete(Xnum, y_idx, axis=1) if Xnum.shape[1] > 1 else None
+        else:
+            self.y_data = None
+        
+        if self.y_data is None:
+            raise ValueError('y_data cannot be None for AAFS dataset')
+        
+        # Later code requires y to start indexing from 0, not 1 (i.e., it should
+        # take values of 0/1 rather than 1/2). Arguably this adjustment should be
+        # done elsewhere.
+        self.y_data = [k-1 for k in self.y_data]
+
+        # Convert numpy arrays to tensors and move to device
+        self.Xcat = torch.tensor(Xcat, device=self.device).long() if Xcat is not None else None
+        self.Xord = torch.tensor(Xord, device=self.device).long() if Xord is not None else None
+        self.Xnum = torch.tensor(Xnum, device=self.device).float() if Xnum is not None else None
+
+        # Convert y_data to tensor and move to device
+        if self.y_data is not None:
+            if y_var_type == 'numerical':
+                self.y_data = torch.tensor(self.y_data, device=self.device).float()
+            else:
+                assert y_var_type in ['categorical', 'ordinal']
+                self.y_data = torch.tensor(self.y_data, device=self.device).long()
+
+        # Stack Xcat, Xord, Xnum, and Mnum for easier subsetting in __getitem__
+        self.X = torch.cat([tensor.float() for tensor in (self.Xcat, self.Xord, self.Xnum, self.Xnum_mask) if tensor is not None], dim=1)
+
+    def __len__(self):
+        """
+        Returns:
+            Adjusted number of observations in the dataset, accounting for data augmentation.
+        """
+        return self.num_obs
+
+    def __getitem__(self, idx):
+        """
+        Given an index, retrieves the corresponding x and y
+    
+        Args:
+            idx (int): The index of the item to be fetched.
+    
+        Returns:
+            tuple: A tuple (x, y)
+        """
+        x = self.X[idx]  # Assuming self.X is a structure that supports indexing
+        y = self.y_data[idx]  # Assuming self.y_data is an array-like structure that supports indexing
+        return x, y
+
+def load_data_objects(train_data, test_data, dataset_spec, hp):
+    """
+    Build and return the data objects for a fold
+
+    This function prepares both training and test datasets and dataloaders
+    using the provided data and hyperparameters. Each dataset is wrapped into an
+    AAFSDataset instance, which is then used to create a DataLoader to enable
+    batch processing during model training and evaluation. If hp contains a batch_size
+    field data loaders are made; otherwise, they are set to None.
+
+    Args:
+        train_data (tuple): A tuple containing training data (Xcat, Xord, Xnum).
+        test_data (tuple): A tuple containing test data features (Xcat_test, Xord_test, Xnum_test).
+        dataset_spec (dict): A dictionary containing variable specifications
+        hp (dict): An optional dictionary containing hyperparameters.
+
+    Returns:
+        tuple: A tuple containing the following elements in order:
+            - Xcat (ndarray): Categorical features of the training data.
+            - Xord (ndarray): Ordinal features of the training data.
+            - Xnum (ndarray): Numeric features of the training data.
+            - aafs_dataset (AAFSDataset): The AAFSDataset instance for training data.
+            - train_dl (DataLoader): The DataLoader for the training data.
+            - Xcat_test (ndarray): Categorical features of the test data.
+            - Xord_test (ndarray): Ordinal features of the test data.
+            - Xnum_test (ndarray): Numeric features of the test data.
+            - aafs_dataset_test (AAFSDataset): The AAFSDataset instance for test data.
+            - test_dl (DataLoader): The DataLoader for the test data.
+    """
+
+    # Make the AAFSDataset and DataLoader objects for training
+    Xcat, Xord, Xnum = train_data
+    aafs_dataset = AAFSDataset(dataset_spec, Xcat, Xord, Xnum)
+    # Make the AAFSDataset and DataLoader objects for testing
+    Xcat_test, Xord_test, Xnum_test = test_data
+    aafs_dataset_test = AAFSDataset(dataset_spec, Xcat_test, Xord_test, Xnum_test)
+
+    if 'batch_size' in hp:
+        train_dl = DataLoader(aafs_dataset, batch_size=hp['batch_size'], shuffle=True)
+        test_dl = DataLoader(aafs_dataset_test, batch_size=hp['batch_size'], shuffle=True)
+    else:
+        train_dl = None
+        test_dl = None
+
+    return Xcat, Xord, Xnum, aafs_dataset, train_dl,\
+        Xcat_test, Xord_test, Xnum_test, aafs_dataset_test, test_dl
 
 def fit_random_forest_wrapper(
         dataset_spec, 
@@ -41,30 +224,17 @@ def fit_random_forest_wrapper(
         study_index_to_prob: Dict mapping study indices to predicted probabilities
     
     """
-    
-    # Extract X and y arrays from training data
-    # y has not yet been extracted from the following matrices. Create
-    # a MixedDataset object that will accomplish the extraction for us.
-    # Do so for both the training and test data.
-    Xcat0, Xord0, Xnum0 = train_data
-    mixed_dataset = MixedDataset(dataset_spec, Xcat0, Xord0, Xnum0)
-    Xcat, Xord, Xnum, y = mixed_dataset.get_arrays()
-    assert Xcat is None
-    X = np.hstack([Xord, Xnum])
-
-    Xcat0_test, Xord0_test, Xnum0_test = test_data
-    mixed_dataset_test = MixedDataset(dataset_spec, Xcat0_test, Xord0_test, Xnum0_test)
-    Xcat_test, Xord_test, Xnum_test, y_test = mixed_dataset_test.get_arrays()
-    assert Xcat_test is None
-
-    # TODO: consider supporting imputation here
+    Xcat, Xord, Xnum, aafs_dataset, _,\
+        Xcat_test, Xord_test, Xnum_test, aafs_dataset_test, _=\
+            load_data_objects(train_data, test_data, dataset_spec, hp)
 
     # Train a random forest
     clf = RandomForestClassifier(n_estimators=hp['num_estimators'])
-    clf.fit(X, y)
+    clf.fit(aafs_dataset.X, aafs_dataset.y_data)
 
     # Predict the probabilities for test data
-    X_test = np.hstack([Xord_test, Xnum_test])
+    X_test = aafs_dataset_test.X
+    y_test = aafs_dataset_test.y_data
     y_pred_prob = clf.predict_proba(X_test)
     num_obs = y_pred_prob.shape[0]
 
@@ -125,37 +295,16 @@ def fit_basic_ann_ensemble_wrapper(
         study_index_to_prob: Dict mapping study indices to predicted probabilities
     
     """
-    # Extract X and y arrays from training data
-    # y has not yet been extracted from the following matrices. Create
-    # a MixedDataset object that will accomplish the extraction for us.
-    # Do so for both the training and test data.
-    Xcat0, Xord0, Xnum0 = train_data
-    mixed_dataset = MixedDataset(dataset_spec, Xcat0, Xord0, Xnum0)
-    Xcat, Xord, Xnum, y = mixed_dataset.get_arrays()
-    # need to start indexing from 0
-    y = [k-1 for k in y]
+    Xcat, Xord, Xnum, aafs_dataset, train_dl,\
+        Xcat_test, Xord_test, Xnum_test, aafs_dataset_test, test_dl=\
+            load_data_objects(train_data, test_data, dataset_spec, hp)
 
-    assert Xcat is None
-    X = np.hstack([Xord, Xnum])
-    train_ds = InputTargetDataset(X,y)
-    train_dl = DataLoader(train_ds, batch_size=hp['batch_size'], shuffle=True)
-
-    Xcat0_test, Xord0_test, Xnum0_test = test_data
-    mixed_dataset_test = MixedDataset(dataset_spec, Xcat0_test, Xord0_test, Xnum0_test)
-    Xcat_test, Xord_test, Xnum_test, y_test = mixed_dataset_test.get_arrays()
-    assert Xcat_test is None
-
-    # need to start indexing from 0
-    y_test = [k-1 for k in y_test]
-    X_test = np.hstack([Xord_test, Xnum_test])
-    test_ds = InputTargetDataset(X_test,y_test)
-    test_dl = DataLoader(test_ds, batch_size=hp['batch_size'], shuffle=True)
 
     base_model_args = (hp['num_x_var'],
                        2, # there are two output categories (female and male)
                        hp['hidden_sizes'],
                        hp['dropout_prob'])
-    # Train an ensemble of basic artificial neural network (ANN)
+    # Train an ensemble of basic artificial neural networks (ANNs)
     ensemble = EnsembleTorchModel(hp['num_models'],
                                   hp['lr'],
                                   BasicAnn,
@@ -164,9 +313,10 @@ def fit_basic_ann_ensemble_wrapper(
     ensemble.train(train_dl, device, hp['epochs'], test_dl)
 
     # Predict the probabilities for test data
-    num_obs = len(y_test)
+    num_obs = len(test_dl)
     with torch.no_grad():
-        test_input = torch.tensor(X_test, dtype=torch.float)
+        #test_input = torch.tensor(aafs_dataset_test.X, dtype=torch.float)
+        test_input = aafs_dataset_test.X
         y_pred_prob = ensemble.predict_prob(test_input, device).cpu().numpy()
     
     # Calculate the test loss for this fold (multiply by the number of
@@ -176,8 +326,9 @@ def fit_basic_ann_ensemble_wrapper(
     # We input the labels just in case all the values in y_test are the
     # same, which can lead to log_loss guessing incorrectly about how
     # y_test is indexed.
-    fold_summed_test_loss = log_loss(y_test, y_pred_prob, labels=[0,1])*num_obs
-    assert len(test_indices) == num_obs
+    fold_summed_test_loss = log_loss(aafs_dataset_test.y_data,
+                                     y_pred_prob, labels=[0,1])*num_obs
+    #assert len(test_indices) == num_obs
 
     study_index_to_prob = dict()
     for i, original_index in enumerate(test_indices):
@@ -425,6 +576,24 @@ def cross_validate(dataset_spec,
 
     return  overall_summed_test_loss, prob_matrix
 
+class StackedXyDataset(Dataset):
+    # A wrapper to stack the constituents of a mixalot.MixedDataset
+    def __init__(self, mixed_dataset):
+        self.mixed_dataset = mixed_dataset
+
+    def __getitem__(self, index):
+        Xcat, Xord, Xnum, Mnum, y = self.mixed_dataset.__getitem__(index)
+    
+        tensors_to_stack = [tensor.float() for tensor in (Xcat, Xord, Xnum, Mnum) if tensor is not None]
+        if tensors_to_stack:
+            stacked_tensors = torch.cat(tensors_to_stack, dim=-1)
+        else:
+            stacked_tensors = None
+    
+        return stacked_tensors, y
+
+    def __len__(self):
+        return self.mixed_dataset.__len__()
 
 class InputTargetDataset(Dataset):
     def __init__(self, inputs, targets):
