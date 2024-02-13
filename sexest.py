@@ -5,7 +5,7 @@ import json
 import pandas as pd
 import numpy as np
 
-def load_aafs_2024_data(num_folds, seed):
+def load_aafs_2024_data(num_folds, seed, remove_missing=False):
     spec_file_path = os.path.join('inputs', 'dataset_spec_aafs_2024.json')
     data_file_path = os.path.join('inputs', 'AAFS Data_MorphoPASSE and DSP2.xlsx')
     mixed_data, num_scalers = load_mixed_data(spec_file_path, data_file_path)
@@ -18,8 +18,11 @@ def load_aafs_2024_data(num_folds, seed):
     # Load the raw data frame since we need to use the Observer and Specimen columns
     raw_df = pd.read_excel(data_file_path)
 
-    # Require no missing values for columns 7 to 19 of filtered_df (the input variables)
-    filtered_df = raw_df.dropna(subset=raw_df.columns[7:19])
+    if remove_missing:
+        # Require no missing values for columns 7 to 19 of filtered_df (the input variables)
+        filtered_df = raw_df.dropna(subset=raw_df.columns[7:19])
+    else:
+        filtered_df = raw_df
 
     observer_counts = filtered_df.groupby('Specimen')['Observer'].nunique()
     specimens_scored_by_both = observer_counts[observer_counts == 2].index.tolist()
@@ -135,7 +138,7 @@ def save_cross_validation_results(output_folder,
                                   hp):
     # Calculate and check the number of observations
     N = obs1_prob_matrix.shape[0]
-    assert N == 56 # we are dropping observations with missing values for now
+    assert N == 92 # we only use operations scored by both observers
     assert obs2_prob_matrix.shape[0] == N
 
     # Convert y_data from a torch tensor to numpy array
@@ -176,6 +179,8 @@ def save_cross_validation_results(output_folder,
     test_losses = {'obs1_mean_test_loss': obs1_mean_test_loss,
                    'obs2_mean_test_loss': obs2_mean_test_loss}
     
+    print('test_losses:')
+    print(test_losses)
     with open(os.path.join(output_folder, 'test_losses.json'), 'w') as f:
         json.dump(test_losses, f)
 
