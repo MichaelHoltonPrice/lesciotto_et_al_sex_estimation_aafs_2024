@@ -11,12 +11,12 @@ def main():
     # num_x_var could be determined from the other inputs
     hp = {'model_type': 'basic ann ensemble',
           'batch_size': 1024,
-          'hidden_sizes': [4,4],
-          'dropout_prob': 0.8,
-          'num_models': 4,
+          'hidden_sizes': [8],
+          'dropout_prob': 0.9,
+          'num_models': 20,
           'lr': 1e-3,
           'final_lr': 1e-3,
-          'num_x_var': 3 + 10, # 3 ordinal and 10 numerical variables
+          'num_x_var': 3 + 2*10, # 3 ordinal and 10 numerical variables, where numerical variables have a NA mask
           'epochs': 10000,
           'num_folds': 23,
           'fold_seed': 884683}
